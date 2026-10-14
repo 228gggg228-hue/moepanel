@@ -1,252 +1,202 @@
+import discord
 import os
-import telebot
-import requests
-from telebot import types
+import re
+import aiohttp
 
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-PASTEFY_TOKEN = os.environ.get("PASTEFY_TOKEN")
-bot = telebot.TeleBot(TOKEN)
+intents = discord.Intents.default()
+intents.message_content = True
 
-# Ваш ID — сюда приходят уведомления о действиях других пользователей
-ADMIN_ID = 8074356414
+client = discord.Client(intents=intents)
 
-# Гифки
-START_GIF = "CgACAgQAAxkBAAEvn0NqypsN_J9-UXdmAef4nVCAaqAgZgACkQkAArcgBVI3Kg7sT5lZoD0E"
-LINK_GIF  = "CgACAgIAAxkBAAEvn0Vqypsj8vvxxumpM0uMdc34JKt4VAACp5YAAvMJsElp9ZAhERb2iT0E"
-FILE_GIF  = "CgACAgIAAxkBAAEvn0lqyps9sf91ReJb1NuEE1QwF629BgAConUAAisv8Ugs2rgz7B9teD0E"
+MY_CHANNEL_ID = 1558758327377338460
+GIF_URL = "https://i.imgur.com/iZuWJ2h.gif"
+FILE_GIF_URL = "https://i.imgur.com/O7diHFX.gif"
+PASTEFY_GIF_URL = "https://i.imgur.com/IzDu2Os.gif"
+URL_PATTERN = re.compile(r'https?://[^\s<>"]+')
 
-links = {}
-files = {}
-paste_links = {}
 
-def log_action(user, action, detail=""):
-    """Отправляет уведомление админу о действии пользователя"""
-    try:
-        if user.id == ADMIN_ID:
-            return  # свои действия не логируем
-        name = user.first_name or ""
-        username = "@" + user.username if user.username else "(нет username)"
-        uid = user.id
-        text = "🔔 " + action + "\n" + name + " " + username + "\nID: " + str(uid)
-        if detail:
-            if len(detail) > 500:
-                detail = detail[:500] + "..."
-            text += "\n\n" + detail
-        bot.send_message(ADMIN_ID, text)
-    except Exception:
-        pass
+def to_raw(link: str) -> str:
+    if "raw.githubusercontent.com" in link:
+        return link
+    if "github.com" in link and "/blob/" in link:
+        return link.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    if "pastefy.app" in link and "/raw" not in link:
+        return link.rstrip("/") + "/raw"
+    if "pastebin.com" in link and "/raw/" not in link:
+        paste_id = link.rstrip("/").split("/")[-1]
+        return f"https://pastebin.com/raw/{paste_id}"
+    if "gist.github.com" in link and "/raw" not in link:
+        return link.rstrip("/") + "/raw"
+    if "hastebin.com" in link and "/raw/" not in link:
+        paste_id = link.rstrip("/").split("/")[-1]
+        return f"https://hastebin.com/raw/{paste_id}"
+    return link
 
-def text_stats(text):
-    lines = text.count("\n") + 1
-    return str(len(text)) + " символов, " + str(lines) + " строк"
 
-def to_raw(u):
-    if "github.com" in u and "/blob/" in u:
-        return u.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-    if "pastefy.app" in u and "/raw" not in u:
-        return u.rstrip("/") + "/raw"
-    if "pastebin.com" in u and "/raw/" not in u:
-        p = u.rstrip("/").split("/")
-        return "https://pastebin.com/raw/" + p[-1]
-    if "gitlab.com" in u and "/-/blob/" in u:
-        return u.replace("/-/blob/", "/-/raw/")
-    return u
+def to_normal(link: str) -> str:
+    if "raw.githubusercontent.com" in link:
+        rest = link.replace("https://raw.githubusercontent.com/", "")
+        parts = rest.split("/")
+        if len(parts) >= 4:
+            owner, repo, branch = parts[0], parts[1], parts[2]
+            path = "/".join(parts[3:])
+            return f"https://github.com/{owner}/{repo}/blob/{branch}/{path}"
+    if "pastefy.app" in link and link.endswith("/raw"):
+        return link[:-4]
+    if "pastebin.com/raw/" in link:
+        paste_id = link.rstrip("/").split("/")[-1]
+        return f"https://pastebin.com/{paste_id}"
+    if "gist.githubusercontent.com" in link:
+        parts = link.replace("https://gist.githubusercontent.com/", "").split("/")
+        if len(parts) >= 2:
+            return f"https://gist.github.com/{parts[0]}/{parts[1]}"
+    if "hastebin.com/raw/" in link:
+        paste_id = link.rstrip("/").split("/")[-1]
+        return f"https://hastebin.com/{paste_id}"
+    return link
 
-def from_raw(u):
-    if "raw.githubusercontent.com" in u:
-        p = u.split("/")
-        return "https://github.com/" + p[3] + "/" + p[4] + "/blob/" + p[5] + "/" + "/".join(p[6:])
-    if "pastefy.app" in u and "/raw" in u:
-        return u.replace("/raw", "")
-    if "pastebin.com/raw/" in u:
-        return u.replace("/raw/", "/")
-    if "gitlab.com" in u and "/-/raw/" in u:
-        return u.replace("/-/raw/", "/-/blob/")
-    if "hastebin.com/raw/" in u:
-        return u.replace("/raw/", "/")
-    return u
 
-def fetch_text(u):
-    try:
-        r = requests.get(u, timeout=15)
-        r.raise_for_status()
-        return r.text
-    except Exception:
-        return None
+def wrap_loadstring(link: str) -> str:
+    raw_link = to_raw(link)
+    return f'loadstring(game:HttpGet("{raw_link}"))()'
 
-def upload_to_pastefy(text):
-    if len(text) > 500000:
-        return "❌ Файл слишком большой для Pastefy (" + str(len(text)) + " символов). Лимит ~500 000."
-    try:
-        r = requests.post(
-            "https://pastefy.app/api/v2/paste",
-            json={"content": text, "title": "from bot", "visibility": "PUBLIC"},
-            timeout=30
-        )
-        if r.status_code == 413:
-            return "❌ Pastefy отклонил файл: слишком большой (413)."
-        if r.status_code >= 400:
-            return "Ошибка Pastefy: " + str(r.status_code) + " " + r.text[:200]
-        data = r.json()
-        paste_id = data.get("paste", {}).get("id")
-        if paste_id:
-            return "https://pastefy.app/" + paste_id
-        return "Нет ID в ответе: " + str(data)
-    except Exception as e:
-        return "Ошибка: " + str(e)
 
-# --- Команда /start ---
-@bot.message_handler(commands=["start"])
-def start_cmd(m):
-    try:
-        bot.send_animation(
-            m.chat.id,
-            START_GIF,
-            caption="Салами, Бибизьян!\nДаай мне ссилку скатина"
-        )
-    except Exception as e:
-        bot.send_message(m.chat.id, "Салами, Бибизьян!\nДаай мне ссилку скатина")
-        bot.send_message(m.chat.id, "Ошибка с гифкой: " + str(e))
+async def fetch_content(link: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.get(link) as resp:
+            if resp.status != 200:
+                raise Exception(f"HTTP {resp.status}")
+            return await resp.text()
 
-# --- Обработка ссылок ---
-@bot.message_handler(func=lambda m: m.text and "http" in m.text)
-def handle_link(m):
-    u = m.text.strip()
-    links[m.chat.id] = u
-    log_action(m.from_user, "📎 Отправил ссылку", u)
 
-    text = fetch_text(u)
-    if text is not None:
-        info = "Что сделать со ссылкой?\n📊 " + text_stats(text)
-    else:
-        info = "Что сделать со ссылкой?\n⚠️ Не удалось скачать содержимое"
+async def upload_to_pastefy(content: str, filename: str = "file.lua") -> str:
+    url = "https://pastefy.app/api/v2/paste"
+    payload = {"content": content, "title": filename, "visibility": "UNLISTED"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=payload) as resp:
+            if resp.status not in (200, 201):
+                text = await resp.text()
+                raise Exception(f"Pastefy HTTP {resp.status}: {text[:200]}")
+            data = await resp.json()
+            paste_id = data.get("paste", {}).get("id") or data.get("id")
+            if not paste_id:
+                raise Exception(f"Не удалось получить ID: {data}")
+            return f"https://pastefy.app/{paste_id}"
 
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(
-        types.InlineKeyboardButton("📎 В raw", callback_data="to_raw"),
-        types.InlineKeyboardButton("✂️ Без raw", callback_data="from_raw"),
-        types.InlineKeyboardButton("📄 Отправить файлом", callback_data="send_file"),
-        types.InlineKeyboardButton("📦 В Pastefy", callback_data="to_pastefy"),
-        types.InlineKeyboardButton("🎮 В loadstring", callback_data="to_loadstring"),
-    )
-    try:
-        bot.send_animation(m.chat.id, LINK_GIF)
-    except Exception:
-        pass
-    bot.reply_to(m, info, reply_markup=markup)
 
-# --- Обработка документов (файлов) ---
-@bot.message_handler(content_types=["document"])
-def handle_document(m):
-    try:
-        file_info = bot.get_file(m.document.file_id)
-        file_bytes = bot.download_file(file_info.file_path)
+class LinkView(discord.ui.View):
+    def __init__(self, link: str):
+        super().__init__(timeout=None)
+        self.link = link
+
+    @discord.ui.button(label="Сделать raw", style=discord.ButtonStyle.primary)
+    async def make_raw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(to_raw(self.link))
+
+    @discord.ui.button(label="Сделать без raw", style=discord.ButtonStyle.success)
+    async def make_normal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(to_normal(self.link))
+
+    @discord.ui.button(label="Отправить файл", style=discord.ButtonStyle.secondary)
+    async def send_file(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        raw_link = to_raw(self.link)
         try:
-            text = file_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            text = file_bytes.decode("latin-1", errors="ignore")
+            content = await fetch_content(raw_link)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка при скачивании: `{e}`")
+            return
+        filename = raw_link.split("/")[-1].split("?")[0] or "file.txt"
+        if "." not in filename:
+            filename += ".txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+        await interaction.followup.send(file=discord.File(filename))
 
-        files[m.chat.id] = text
-        log_action(
-            m.from_user,
-            "📄 Отправил файл",
-            m.document.file_name + " (" + str(len(text)) + " символов)"
-        )
+    @discord.ui.button(label="loadstring", style=discord.ButtonStyle.danger)
+    async def make_loadstring(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(wrap_loadstring(self.link))
 
+    @discord.ui.button(label="Pastefy", style=discord.ButtonStyle.primary, row=1)
+    async def make_pastefy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        raw_link = to_raw(self.link)
         try:
-            bot.send_animation(m.chat.id, FILE_GIF)
-        except Exception:
-            pass
-
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📦 Сохранить в Pastefy", callback_data="file_to_pastefy"))
-        bot.reply_to(
-            m,
-            "Файл получен: " + m.document.file_name + "\n📊 " + text_stats(text) + "\nСохранить содержимое в Pastefy?",
-            reply_markup=markup
-        )
-    except Exception as e:
-        bot.reply_to(m, "Не удалось обработать файл: " + str(e))
-
-@bot.callback_query_handler(func=lambda c: True)
-def handle_button(c):
-    chat_id = c.message.chat.id
-
-    if c.data == "file_to_pastefy":
-        text = files.get(chat_id)
-        if not text:
-            bot.answer_callback_query(c.id, "Файл потерялся, отправь заново")
+            content = await fetch_content(raw_link)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка при скачивании: `{e}`")
             return
-        result = upload_to_pastefy(text)
-        bot.send_message(chat_id, result)
-        if result.startswith("https://pastefy.app/"):
-            paste_links[chat_id] = result
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            markup.add(
-                types.InlineKeyboardButton("📎 Сделать raw", callback_data="paste_to_raw"),
-                types.InlineKeyboardButton("🎮 Сделать loadstring", callback_data="paste_to_loadstring"),
-            )
-            bot.send_message(chat_id, "Что сделать с этой ссылкой?", reply_markup=markup)
-        bot.answer_callback_query(c.id)
-        return
-
-    if c.data == "paste_to_raw":
-        u = paste_links.get(chat_id, "")
-        if not u:
-            bot.answer_callback_query(c.id, "Ссылка потерялась")
+        filename = raw_link.split("/")[-1].split("?")[0] or "file.lua"
+        try:
+            paste_link = await upload_to_pastefy(content, filename)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка Pastefy: `{e}`")
             return
-        bot.send_message(chat_id, u + "/raw")
-        bot.answer_callback_query(c.id)
-        return
+        await interaction.followup.send(paste_link)
 
-    if c.data == "paste_to_loadstring":
-        u = paste_links.get(chat_id, "")
-        if not u:
-            bot.answer_callback_query(c.id, "Ссылка потерялась")
+
+class FileView(discord.ui.View):
+    def __init__(self, content: str, filename: str):
+        super().__init__(timeout=None)
+        self.content = content
+        self.filename = filename
+
+    @discord.ui.button(label="Pastefy", style=discord.ButtonStyle.primary)
+    async def make_pastefy(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer()
+        filename = self.filename or "file.lua"
+        try:
+            paste_link = await upload_to_pastefy(self.content, filename)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка Pastefy: `{e}`")
             return
-        bot.send_message(chat_id, 'loadstring(game:HttpGet("' + u + '/raw"))()')
-        bot.answer_callback_query(c.id)
+        view = LinkView(paste_link)
+        embed = discord.Embed()
+        embed.set_image(url=PASTEFY_GIF_URL)
+        await interaction.followup.send(paste_link, view=view, embed=embed)
+
+
+@client.event
+async def on_ready():
+    print(f'Бот {client.user} запущен и готов к работе!')
+
+
+@client.event
+async def on_message(message):
+    if message.author == client.user:
+        return
+    if message.channel.id != MY_CHANNEL_ID:
         return
 
-    u = links.get(chat_id, "")
-    if not u:
-        bot.answer_callback_query(c.id, "Ссылка потерялась, отправь заново")
+    content = message.content.strip()
+
+    # 1. Вложение
+    if message.attachments:
+        attachment = message.attachments[0]
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(attachment.url) as resp:
+                    if resp.status != 200:
+                        await message.reply(f"❌ Не удалось скачать файл (HTTP {resp.status}).")
+                        return
+                    file_content = await resp.text()
+        except Exception as e:
+            await message.reply(f"❌ Ошибка при скачивании файла: `{e}`")
+            return
+
+        view = FileView(file_content, attachment.filename)
+        embed = discord.Embed()
+        embed.set_image(url=FILE_GIF_URL)
+        await message.reply("Что сделать с этим файлом?", view=view, embed=embed)
         return
 
-    if c.data == "to_raw":
-        bot.send_message(chat_id, to_raw(u))
-    elif c.data == "from_raw":
-        bot.send_message(chat_id, from_raw(u))
-    elif c.data == "send_file":
-        text = fetch_text(u)
-        if text is None:
-            bot.send_message(chat_id, "Не удалось скачать содержимое")
-        else:
-            with open("/tmp/file.txt", "w", encoding="utf-8") as f:
-                f.write(text)
-            with open("/tmp/file.txt", "rb") as f:
-                bot.send_document(chat_id, f)
-    elif c.data == "to_pastefy":
-        text = fetch_text(u)
-        if text is None:
-            bot.send_message(chat_id, "Не удалось скачать содержимое")
-        else:
-            result = upload_to_pastefy(text)
-            bot.send_message(chat_id, result)
-    elif c.data == "to_loadstring":
-        raw_url = u
-        if "pastefy.app" in raw_url and "/raw" not in raw_url:
-            raw_url = raw_url.rstrip("/") + "/raw"
-        elif "github.com" in raw_url and "/blob/" in raw_url:
-            raw_url = raw_url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-        elif "pastebin.com" in raw_url and "/raw/" not in raw_url:
-            p = raw_url.rstrip("/").split("/")
-            raw_url = "https://pastebin.com/raw/" + p[-1]
-        elif "gitlab.com" in raw_url and "/-/blob/" in raw_url:
-            raw_url = raw_url.replace("/-/blob/", "/-/raw/")
-        bot.send_message(chat_id, 'loadstring(game:HttpGet("' + raw_url + '"))()')
+    # 2. Ссылка
+    match = URL_PATTERN.search(content)
+    if match:
+        view = LinkView(match.group(0))
+        embed = discord.Embed()
+        embed.set_image(url=GIF_URL)
+        await message.reply("Что сделать с этой ссылкой?", view=view, embed=embed)
 
-    bot.answer_callback_query(c.id)
 
-print("Бот запущен")
-bot.polling(none_stop=True)
+client.run(os.environ["DISCORD_BOT_TOKEN"], reconnect=True)
